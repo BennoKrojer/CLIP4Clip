@@ -242,11 +242,11 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             self.lstm_visual = nn.LSTM(input_size=cross_config.hidden_size, hidden_size=cross_config.hidden_size,
                                        batch_first=True, bidirectional=False, num_layers=1)
 
-        self.loss_fct = CrossEn()
+        self.loss_fct = nn.CrossEntropyLoss()
 
         self.apply(self.init_weights)
 
-    def forward(self, input_ids, token_type_ids, attention_mask, video, video_mask=None):
+    def forward(self, input_ids, token_type_ids, attention_mask, video, target, video_mask=None, train=True):
         input_ids = input_ids.view(-1, input_ids.shape[-1])
         token_type_ids = token_type_ids.view(-1, token_type_ids.shape[-1])
         attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
@@ -254,25 +254,39 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         # T x 3 x H x W
         video = torch.as_tensor(video).float()
-        b, pair, bs, ts, channel, h, w = video.shape
-        video = video.view(b * pair * bs * ts, channel, h, w)
-        video_frame = bs * ts
+        b, _, channel, h, w = video.shape
+        video = video.view(b * 10, channel, h, w)
+        video_frame = 10
 
         sequence_output, visual_output = self.get_sequence_visual_output(input_ids, token_type_ids, attention_mask,
                                                                          video, video_mask, shaped=True, video_frame=video_frame)
 
-        if self.training:
-            loss = 0.
-            sim_matrix, *_tmp = self.get_similarity_logits(sequence_output, visual_output, attention_mask, video_mask,
-                                                    shaped=True, loose_type=self.loose_type)
-            sim_loss1 = self.loss_fct(sim_matrix)
-            sim_loss2 = self.loss_fct(sim_matrix.T)
-            sim_loss = (sim_loss1 + sim_loss2) / 2
-            loss += sim_loss
+        visual_output = self._loose_similarity(visual_output=visual_output, video_mask=video_mask, sim_header=self.loose_type)
+        
+        logit_scale = self.clip.logit_scale.exp()
+        sequence_output = sequence_output.squeeze()
+        visual_output = visual_output.reshape(b, 10, 512)
+        sequence_output = sequence_output / sequence_output.norm(dim=-1, keepdim=True)
+        visual_output = visual_output / visual_output.norm(dim=-1, keepdim=True)
+        similarity = (visual_output @ sequence_output.unsqueeze(2)).squeeze() * logit_scale
+        if b == 1:
+            similarity = similarity.unsqueeze(0)
+        if not train:
+            return similarity
+        loss = self.loss_fct(similarity, target)
+        return loss
+        # if self.training:
+        #     loss = 0.
+        #     sim_matrix, *_tmp = self.get_similarity_logits(sequence_output, visual_output, attention_mask, video_mask,
+        #                                             shaped=True, loose_type=self.loose_type)
+        #     sim_loss1 = self.loss_fct(sim_matrix)
+        #     sim_loss2 = self.loss_fct(sim_matrix.T)
+        #     sim_loss = (sim_loss1 + sim_loss2) / 2
+        #     loss += sim_loss
 
-            return loss
-        else:
-            return None
+        #     return loss
+        # else:
+        #     return None
 
     def get_sequence_output(self, input_ids, token_type_ids, attention_mask, shaped=False):
         if shaped is False:
@@ -351,8 +365,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         return text_out, video_out
 
-    def _loose_similarity(self, sequence_output, visual_output, attention_mask, video_mask, sim_header="meanP"):
-        sequence_output, visual_output = sequence_output.contiguous(), visual_output.contiguous()
+    def _loose_similarity(self, visual_output, video_mask, sim_header="meanP"):
+        # sequence_output, visual_output = sequence_output.contiguous(), visual_output.contiguous()
 
         if sim_header == "meanP":
             # Default: Parameter-free type
@@ -383,22 +397,22 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             visual_output = visual_output.permute(1, 0, 2)  # LND -> NLD
             visual_output = visual_output + visual_output_original
 
-        if self.training:
-            visual_output = allgather(visual_output, self.task_config)
-            video_mask = allgather(video_mask, self.task_config)
-            sequence_output = allgather(sequence_output, self.task_config)
-            torch.distributed.barrier()
+        # if self.training:
+        #     visual_output = allgather(visual_output, self.task_config)
+        #     video_mask = allgather(video_mask, self.task_config)
+        #     sequence_output = allgather(sequence_output, self.task_config)
+        #     torch.distributed.barrier()
 
-        visual_output = visual_output / visual_output.norm(dim=-1, keepdim=True)
-        visual_output = self._mean_pooling_for_similarity_visual(visual_output, video_mask)
-        visual_output = visual_output / visual_output.norm(dim=-1, keepdim=True)
+        # visual_output = visual_output / visual_output.norm(dim=-1, keepdim=True)
+        # visual_output = self._mean_pooling_for_similarity_visual(visual_output, video_mask)
+        # visual_output = visual_output / visual_output.norm(dim=-1, keepdim=True)
 
-        sequence_output = sequence_output.squeeze(1)
-        sequence_output = sequence_output / sequence_output.norm(dim=-1, keepdim=True)
+        # sequence_output = sequence_output.squeeze(1)
+        # sequence_output = sequence_output / sequence_output.norm(dim=-1, keepdim=True)
 
-        logit_scale = self.clip.logit_scale.exp()
-        retrieve_logits = logit_scale * torch.matmul(sequence_output, visual_output.t())
-        return retrieve_logits
+        # logit_scale = self.clip.logit_scale.exp()
+        # retrieve_logits = logit_scale * torch.matmul(sequence_output, visual_output.t())
+        return visual_output
 
     def _cross_similarity(self, sequence_output, visual_output, attention_mask, video_mask):
         sequence_output, visual_output = sequence_output.contiguous(), visual_output.contiguous()
